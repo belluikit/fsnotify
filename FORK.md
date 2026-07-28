@@ -81,3 +81,14 @@ token — so #1 is a frequent *cause* of #2.
 
 Measured: 4 hung `Close`s per 200 watcher rounds before, **0 after**, with the
 process handle count going from a slow upward drift to flat.
+
+Versioning
+----------
+
+The fork carries its own tag line starting at **v1.9.1** — "upstream v1.9.0 plus
+the two fixes above" — the same way [belluikit/glfw] runs its own versions
+independent of GLFW's. The module path is ours, so this can never collide with
+an upstream v1.9.1.
+
+When rebasing onto a newer upstream release, keep the base version legible: a
+fork of upstream v1.10.1 should be tagged v1.10.2, not v1.9.2.
