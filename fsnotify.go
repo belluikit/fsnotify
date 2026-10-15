@@ -51,26 +51,25 @@ import (
 // The fs.inotify.max_user_watches sysctl variable specifies the upper limit
 // for the number of watches per user, and fs.inotify.max_user_instances
 // specifies the maximum number of inotify instances per user. Every Watcher you
-// create is an "instance", and every path you add is a "watch".
+// create is an "instance", and every path you add is a "watch". Reaching the
+// limit will result in a "no space left on device" or "too many open files"
+// error.
 //
 // These are also exposed in /proc as /proc/sys/fs/inotify/max_user_watches and
-// /proc/sys/fs/inotify/max_user_instances
+// /proc/sys/fs/inotify/max_user_instances. The default values differ per distro
+// and available memory.
 //
 // To increase them you can use sysctl or write the value to the /proc file:
 //
-//	# Default values on Linux 5.18
-//	sysctl fs.inotify.max_user_watches=124983
-//	sysctl fs.inotify.max_user_instances=128
+//	sysctl fs.inotify.max_user_watches=200000
+//	sysctl fs.inotify.max_user_instances=256
 //
 // To make the changes persist on reboot edit /etc/sysctl.conf or
 // /usr/lib/sysctl.d/50-default.conf (details differ per Linux distro; check
 // your distro's documentation):
 //
-//	fs.inotify.max_user_watches=124983
-//	fs.inotify.max_user_instances=128
-//
-// Reaching the limit will result in a "no space left on device" or "too many open
-// files" error.
+//	fs.inotify.max_user_watches=200000
+//	fs.inotify.max_user_instances=256
 //
 // # kqueue notes (macOS, BSD)
 //
@@ -92,51 +91,13 @@ import (
 // directory itself, but may not send events for all files in that directory.
 // Sometimes it will send events for all files, sometimes it will send no
 // events, and often only for some files.
-//
-// The default ReadDirectoryChangesW() buffer size is 64K, which is the largest
-// value that is guaranteed to work with SMB filesystems. If you have many
-// events in quick succession this may not be enough, and you will have to use
-// [WithBufferSize] to increase the value.
 type Watcher struct {
 	b backend
 
 	// Events sends the filesystem change events.
 	//
-	// fsnotify can send the following events; a "path" here can refer to a
-	// file, directory, symbolic link, or special file like a FIFO.
-	//
-	//   fsnotify.Create    A new path was created; this may be followed by one
-	//                      or more Write events if data also gets written to a
-	//                      file.
-	//
-	//   fsnotify.Remove    A path was removed.
-	//
-	//   fsnotify.Rename    A path was renamed. A rename is always sent with the
-	//                      old path as Event.Name, and a Create event will be
-	//                      sent with the new name. Renames are only sent for
-	//                      paths that are currently watched; e.g. moving an
-	//                      unmonitored file into a monitored directory will
-	//                      show up as just a Create. Similarly, renaming a file
-	//                      to outside a monitored directory will show up as
-	//                      only a Rename.
-	//
-	//   fsnotify.Write     A file or named pipe was written to. A Truncate will
-	//                      also trigger a Write. A single "write action"
-	//                      initiated by the user may show up as one or multiple
-	//                      writes, depending on when the system syncs things to
-	//                      disk. For example when compiling a large Go program
-	//                      you may get hundreds of Write events, and you may
-	//                      want to wait until you've stopped receiving them
-	//                      (see the dedup example in cmd/fsnotify).
-	//
-	//                      Some systems may send Write event for directories
-	//                      when the directory content changes.
-	//
-	//   fsnotify.Chmod     Attributes were changed. On Linux this is also sent
-	//                      when a file is removed (or more accurately, when a
-	//                      link to an inode is removed). On kqueue it's sent
-	//                      when a file is truncated. On Windows it's never
-	//                      sent.
+	// fsnotify can send Create, Remove, Rename, Write, or Chmod events. See the
+	// documentation on them for details.
 	Events chan Event
 
 	// Errors sends any errors.
@@ -175,23 +136,34 @@ type Op uint32
 // The operations fsnotify can trigger; see the documentation on [Watcher] for a
 // full description, and check them with [Event.Has].
 const (
-	// A new pathname was created.
+	// A new path was created; this may be followed by one or more [Write]
+	// events if data also gets written to a file.
 	Create Op = 1 << iota
 
-	// The pathname was written to; this does *not* mean the write has finished,
-	// and a write can be followed by more writes.
+	// A file or named pipe was written to. A Truncate will also trigger a
+	// Write. A single "write action" initiated by the user may show up as one
+	// or multiple writes, depending on when the system syncs things to disk.
+	// For example when compiling a large Go program you may get hundreds of
+	// Write events, and you may want to wait until you've stopped receiving
+	// them (see the dedup example in cmd/fsnotify).
 	Write
 
 	// The path was removed; any watches on it will be removed. Some "remove"
-	// operations may trigger a Rename if the file is actually moved (for
-	// example "remove to trash" is often a rename).
+	// operations may trigger a [Rename] event if the file is actually moved
+	// (for example "remove to trash" is often a rename).
 	Remove
 
-	// The path was renamed to something else; any watches on it will be
-	// removed.
+	// A path was renamed. A rename is always sent with the old path as
+	// Event.Name, and a [Create] event will be sent with the new name. Renames
+	// are only sent for paths that are currently watched; e.g. moving an
+	// unmonitored file into a monitored directory will show up as just a
+	// Create. Similarly, renaming a file to outside a monitored directory will
+	// show up as only a Rename.
 	Rename
 
-	// File attributes were changed.
+	// Attributes were changed. On Linux this is also sent when a file is
+	// removed (or more accurately, when a link to an inode is removed). On
+	// kqueue it's sent when a file is truncated. On Windows it's never sent.
 	//
 	// It's generally not recommended to take action on this event, as it may
 	// get triggered very frequently by some software. For example, Spotlight
@@ -220,7 +192,7 @@ const (
 
 	// File opened for reading was closed.
 	//
-	// Only works on Linux and FreeBSD.
+	// Only works on Linux.
 	xUnportableCloseRead
 )
 
@@ -410,7 +382,6 @@ type (
 	withOpts struct {
 		bufsize    int
 		op         Op
-		noFollow   bool
 		sendCreate bool
 	}
 )
@@ -469,12 +440,6 @@ func withOps(op Op) addOpt {
 	return func(opt *withOpts) { opt.op = op }
 }
 
-// WithNoFollow disables following symlinks, so the symlinks themselves are
-// watched.
-func withNoFollow() addOpt {
-	return func(opt *withOpts) { opt.noFollow = true }
-}
-
 // "Internal" option for recursive watches on inotify.
 func withCreate() addOpt {
 	return func(opt *withOpts) { opt.sendCreate = true }
@@ -494,3 +459,20 @@ func recursivePath(path string) (string, bool) {
 	}
 	return path, false
 }
+
+func hasPathPrefix(path, root string) bool {
+	if path == root {
+		return true
+	}
+	return strings.HasPrefix(path, root+string(os.PathSeparator))
+}
+
+type watchFlag uint8
+
+const (
+	// Added by user with Add(), rather than an internal watch.
+	flagByUser = watchFlag(0x01)
+	// Part of recursive watch; as the top-level path added by the user or an
+	// "internal" watch.
+	flagRecurse = watchFlag(0x02)
+)

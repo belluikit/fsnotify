@@ -1,12 +1,16 @@
 Bellui fork of fsnotify
 =======================
 
-Fork of [fsnotify/fsnotify] at **v1.9.0**, module path rewritten to
+Fork of [fsnotify/fsnotify], module path rewritten to
 `github.com/belluikit/fsnotify` (the same convention as [belluikit/glfw] and
 [belluikit/glfw-js] — imports are swapped at the call site, no `replace`
 directive).
 
 Everything outside `backend_windows.go` is upstream, untouched.
+
+The fork started from upstream **v1.9.0** (tagged here as v1.9.1). Since then it
+has merged upstream `main` at `20b1e15` (v1.10.1 plus 8 commits); upstream is
+a git remote and later syncs are plain merges of its `main`.
 
 [fsnotify/fsnotify]: https://github.com/fsnotify/fsnotify
 [belluikit/glfw]: https://github.com/belluikit/glfw

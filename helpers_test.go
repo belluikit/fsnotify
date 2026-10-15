@@ -1,12 +1,13 @@
 package fsnotify
 
 import (
+	"cmp"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,12 +93,7 @@ const noWait = ""
 
 func shouldWait(path ...string) bool {
 	// Take advantage of the fact that join skips empty parameters.
-	for _, p := range path {
-		if p == "" {
-			return false
-		}
-	}
-	return true
+	return !slices.Contains(path, noWait)
 }
 
 // Create n empty files with the prefix in the directory dir.
@@ -117,7 +113,7 @@ func createFiles(t *testing.T, dir, prefix string, n int, d time.Duration) int {
 		max     = time.After(d)
 		created int
 	)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		select {
 		case <-max:
 			t.Logf("createFiles: stopped at %s files because it took longer than %s", fmtNum(created), d)
@@ -429,15 +425,15 @@ func (w *eventCollector) collect(t *testing.T) {
 			select {
 			case e, ok := <-w.w.Errors:
 				if !ok {
-					w.done <- struct{}{}
+					close(w.done)
 					return
 				}
 				t.Errorf("eventCollector: unexpected error on Errors chan: %s", e)
-				w.done <- struct{}{}
+				close(w.done)
 				return
 			case e, ok := <-w.w.Events:
 				if !ok {
-					w.done <- struct{}{}
+					close(w.done)
 					return
 				}
 				w.mu.Lock()
@@ -608,12 +604,8 @@ func cmpEvents(t *testing.T, tmp string, have, want Events) {
 	have = have.TrimPrefix(tmp)
 
 	haveSort, wantSort := have.copy(), want.copy()
-	sort.Slice(haveSort, func(i, j int) bool {
-		return haveSort[i].String() > haveSort[j].String()
-	})
-	sort.Slice(wantSort, func(i, j int) bool {
-		return wantSort[i].String() > wantSort[j].String()
-	})
+	slices.SortFunc(haveSort, func(a, b Event) int { return cmp.Compare(a.String(), b.String()) })
+	slices.SortFunc(wantSort, func(a, b Event) int { return cmp.Compare(a.String(), b.String()) })
 
 	if haveSort.String() != wantSort.String() {
 		b := new(strings.Builder)
@@ -668,15 +660,6 @@ func supportsRename() bool {
 		return true
 	default:
 		return false
-	}
-}
-
-func supportsNofollow(t *testing.T) {
-	switch runtime.GOOS {
-	case "linux":
-		// Run test.
-	default:
-		t.Skip("withNoFollow() not yet supported on " + runtime.GOOS)
 	}
 }
 
@@ -759,20 +742,36 @@ func parseScript(t *testing.T, in string) {
 	}
 
 	var (
-		do      = make([]func(), 0, len(cmds))
-		w       = newCollector(t)
+		repeat  = 1
+		do      = make([]func(*Watcher), 0, len(cmds))
 		mustArg = func(c command, n int) {
 			if len(c.args) != n {
 				t.Fatalf("line %d: %q requires exactly %d argument (have %d: %q)",
 					c.line, c.cmd, n, len(c.args), c.args)
 			}
 		}
+		atleastArg = func(c command, n int) {
+			if len(c.args) < 1 {
+				t.Fatalf("line %d: %q requires at least %d arguments (have %d: %q)",
+					c.line, c.cmd, 1, len(c.args), c.args)
+			}
+		}
 	)
 loop:
 	for _, c := range cmds {
-		c := c
 		//fmt.Printf("line %d: %q  %q\n", c.line, c.cmd, c.args)
 		switch c.cmd {
+		case "repeat":
+			mustArg(c, 1)
+			n, err := strconv.ParseInt(c.args[0], 10, 0)
+			if err != nil {
+				t.Fatalf("line %d: %s", c.line, err)
+			}
+			if n == 0 {
+				t.Fatalf("line %d: repeat must be higher than 0", c.line)
+			}
+			repeat = int(n)
+
 		case "skip", "require":
 			mustArg(c, 1)
 			switch c.args[0] {
@@ -823,8 +822,6 @@ loop:
 				supportsRecurse(t)
 			case "filter":
 				supportsFilter(t)
-			case "nofollow":
-				supportsNofollow(t)
 			case "windows":
 				if runtime.GOOS == "windows" {
 					t.Skip("Skipping on Windows")
@@ -840,16 +837,21 @@ loop:
 			default:
 				t.Fatalf("line %d: unknown %s reason: %q", c.line, c.cmd, c.args[0])
 			}
-		//case "state":
-		//	mustArg(c, 0)
-		//	do = append(do, func() { eventSeparator(); fmt.Fprintln(os.Stderr); w.w.state(); fmt.Fprintln(os.Stderr) })
+		case "state":
+			mustArg(c, 0)
+			do = append(do, func(w *Watcher) {
+				eventSeparator()
+				fmt.Fprintln(os.Stderr)
+				w.b.(interface{ state() }).state()
+				fmt.Fprintln(os.Stderr)
+			})
 		case "debug":
 			mustArg(c, 1)
 			switch c.args[0] {
 			case "1", "on", "true", "yes":
-				do = append(do, func() { debug = true })
+				do = append(do, func(w *Watcher) { debug = true })
 			case "0", "off", "false", "no":
-				do = append(do, func() { debug = false })
+				do = append(do, func(w *Watcher) { debug = false })
 			default:
 				t.Fatalf("line %d: unknown debug: %q", c.line, c.args[0])
 			}
@@ -857,22 +859,10 @@ loop:
 			mustArg(c, 0)
 			break loop
 		case "watch":
-			if len(c.args) < 1 {
-				t.Fatalf("line %d: %q requires at least %d arguments (have %d: %q)",
-					c.line, c.cmd, 1, len(c.args), c.args)
-			}
+			atleastArg(c, 1)
 			if len(c.args) == 1 {
-				do = append(do, func() { addWatch(t, w.w, tmppath(tmp, c.args[0])) })
+				do = append(do, func(w *Watcher) { addWatch(t, w, tmppath(tmp, c.args[0])) })
 				continue
-			}
-
-			var follow addOpt
-			for i := range c.args {
-				if c.args[i] == "nofollow" || c.args[i] == "no-follow" {
-					c.args = append(c.args[:i], c.args[i+1:]...)
-					follow = withNoFollow()
-					break
-				}
 			}
 
 			var op Op
@@ -902,33 +892,46 @@ loop:
 					op |= xUnportableCloseRead
 				}
 			}
-			do = append(do, func() {
+			do = append(do, func(w *Watcher) {
 				p := tmppath(tmp, c.args[0])
-				err := w.w.AddWith(p, withOps(op), follow)
+				err := w.AddWith(p, withOps(op))
 				if err != nil {
 					t.Fatalf("line %d: addWatch(%q): %s", c.line+1, p, err)
 				}
 			})
 		case "print":
-			do = append(do, func() { fmt.Println(strings.Join(c.args, " ")) })
+			do = append(do, func(w *Watcher) { fmt.Println(strings.Join(c.args, " ")) })
 		case "unwatch":
 			mustArg(c, 1)
-			do = append(do, func() { rmWatch(t, w.w, tmppath(tmp, c.args[0])) })
+			do = append(do, func(w *Watcher) { rmWatch(t, w, tmppath(tmp, c.args[0])) })
 		case "watchlist":
-			mustArg(c, 1)
+			atleastArg(c, 1)
 			n, err := strconv.ParseInt(c.args[0], 10, 0)
-			if err != nil {
-				t.Fatalf("line %d: %s", c.line, err)
+			if err == nil { // Assert length
+				do = append(do, func(w *Watcher) {
+					wl := w.WatchList()
+					if l := int64(len(wl)); l != n {
+						t.Errorf("line %d: watchlist has %d entries, not %d\n%q", c.line, l, n, wl)
+					}
+				})
+			} else { // Assert contents
+				do = append(do, func(w *Watcher) {
+					have := w.WatchList()
+					for i := range c.args {
+						c.args[i] = tmppath(tmp, c.args[i])
+					}
+					slices.Sort(c.args)
+					slices.Sort(have)
+					if !slices.Equal(c.args, have) {
+						t.Errorf("line %d: watchlist has incorrect entries\n  have:\n    %s\n  want:\n    %s", c.line,
+							strings.Join(have, "\n    "),
+							strings.Join(c.args, "\n    "))
+					}
+				})
 			}
-			do = append(do, func() {
-				wl := w.w.WatchList()
-				if l := int64(len(wl)); l != n {
-					t.Errorf("line %d: watchlist has %d entries, not %d\n%q", c.line, l, n, wl)
-				}
-			})
 		case "touch":
 			mustArg(c, 1)
-			do = append(do, func() { touch(t, tmppath(tmp, c.args[0])) })
+			do = append(do, func(w *Watcher) { touch(t, tmppath(tmp, c.args[0])) })
 		case "mkdir":
 			recur := false
 			if len(c.args) == 2 && c.args[0] == "-p" {
@@ -936,29 +939,29 @@ loop:
 			}
 			mustArg(c, 1)
 			if recur {
-				do = append(do, func() { mkdirAll(t, tmppath(tmp, c.args[0])) })
+				do = append(do, func(w *Watcher) { mkdirAll(t, tmppath(tmp, c.args[0])) })
 			} else {
-				do = append(do, func() { mkdir(t, tmppath(tmp, c.args[0])) })
+				do = append(do, func(w *Watcher) { mkdir(t, tmppath(tmp, c.args[0])) })
 			}
 		case "ln":
 			mustArg(c, 3)
 			if c.args[0] != "-s" {
 				t.Fatalf("line %d: only ln -s is supported", c.line)
 			}
-			do = append(do, func() { symlink(t, tmppath(tmp, c.args[1]), tmppath(tmp, c.args[2])) })
+			do = append(do, func(w *Watcher) { symlink(t, tmppath(tmp, c.args[1]), tmppath(tmp, c.args[2])) })
 		case "mkfifo":
 			mustArg(c, 1)
-			do = append(do, func() { mkfifo(t, tmppath(tmp, c.args[0])) })
+			do = append(do, func(w *Watcher) { mkfifo(t, tmppath(tmp, c.args[0])) })
 		case "mknod":
 			mustArg(c, 2)
 			n, err := strconv.ParseInt(c.args[0], 10, 0)
 			if err != nil {
 				t.Fatalf("line %d: %s", c.line, err)
 			}
-			do = append(do, func() { mknod(t, int(n), tmppath(tmp, c.args[1])) })
+			do = append(do, func(w *Watcher) { mknod(t, int(n), tmppath(tmp, c.args[1])) })
 		case "mv":
 			mustArg(c, 2)
-			do = append(do, func() { mv(t, tmppath(tmp, c.args[0]), tmppath(tmp, c.args[1])) })
+			do = append(do, func(w *Watcher) { mv(t, tmppath(tmp, c.args[0]), tmppath(tmp, c.args[1])) })
 		case "rm":
 			recur := false
 			if len(c.args) == 2 && c.args[0] == "-r" {
@@ -966,9 +969,9 @@ loop:
 			}
 			mustArg(c, 1)
 			if recur {
-				do = append(do, func() { rmAll(t, tmppath(tmp, c.args[0])) })
+				do = append(do, func(w *Watcher) { rmAll(t, tmppath(tmp, c.args[0])) })
 			} else {
-				do = append(do, func() { rm(t, tmppath(tmp, c.args[0])) })
+				do = append(do, func(w *Watcher) { rm(t, tmppath(tmp, c.args[0])) })
 			}
 		case "chmod":
 			mustArg(c, 2)
@@ -976,10 +979,10 @@ loop:
 			if err != nil {
 				t.Fatalf("line %d: %s", c.line, err)
 			}
-			do = append(do, func() { chmod(t, fs.FileMode(n), tmppath(tmp, c.args[1])) })
+			do = append(do, func(w *Watcher) { chmod(t, fs.FileMode(n), tmppath(tmp, c.args[1])) })
 		case "cat":
 			mustArg(c, 1)
-			do = append(do, func() { cat(t, tmppath(tmp, c.args[0])) })
+			do = append(do, func(w *Watcher) { cat(t, tmppath(tmp, c.args[0])) })
 		case "echo":
 			if len(c.args) < 2 || len(c.args) > 3 {
 				t.Fatalf("line %d: %q requires 2 or 3 arguments (have %d: %q)",
@@ -998,9 +1001,9 @@ loop:
 
 			switch op {
 			case ">":
-				do = append(do, func() { echoTrunc(t, data, tmppath(tmp, dst)) })
+				do = append(do, func(w *Watcher) { echoTrunc(t, data, tmppath(tmp, dst)) })
 			case ">>":
-				do = append(do, func() { echoAppend(t, data, tmppath(tmp, dst)) })
+				do = append(do, func(w *Watcher) { echoAppend(t, data, tmppath(tmp, dst)) })
 			default:
 				t.Fatalf("line %d: echo requires > (truncate) or >> (append): echo data >file", c.line)
 			}
@@ -1010,16 +1013,31 @@ loop:
 			if err != nil {
 				t.Fatalf("line %d: %s", c.line, err)
 			}
-			do = append(do, func() { time.Sleep(time.Duration(n) * time.Millisecond) })
+			do = append(do, func(w *Watcher) { time.Sleep(time.Duration(n) * time.Millisecond) })
 		default:
 			t.Errorf("line %d: unknown command %q", c.line, c.cmd)
 		}
 	}
 
-	w.collect(t)
-	for _, d := range do {
-		d()
+	run := func(t *testing.T) {
+		w := newCollector(t)
+
+		w.collect(t)
+		for _, d := range do {
+			d(w.w)
+		}
+		ev := w.stop(t)
+		cmpEvents(t, tmp, ev, newEvents(t, want))
 	}
-	ev := w.stop(t)
-	cmpEvents(t, tmp, ev, newEvents(t, want))
+
+	if repeat == 1 {
+		run(t)
+	} else {
+		for i := range repeat {
+			t.Run(fmt.Sprintf("#%02d", i), run)
+			if t.Failed() {
+				break
+			}
+		}
+	}
 }

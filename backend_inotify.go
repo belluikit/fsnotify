@@ -55,16 +55,19 @@ type (
 		path map[string]uint32 // pathname → wd
 	}
 	watch struct {
-		wd      uint32 // Watch descriptor (as returned by the inotify_add_watch() syscall)
-		flags   uint32 // inotify flags of this watch (see inotify(7) for the list of valid flags)
-		path    string // Watch path.
-		recurse bool   // Recursion with ./...?
+		wd         uint32 // Watch descriptor (as returned by the inotify_add_watch() syscall)
+		flags      uint32 // inotify flags of this watch (see inotify(7) for the list of valid flags)
+		path       string // Watch path.
+		watchFlags watchFlag
 	}
 	koekje struct {
 		cookie uint32
 		path   string
 	}
 )
+
+func (w watch) byUser() bool  { return w.watchFlags&flagByUser != 0 }
+func (w watch) recurse() bool { return w.watchFlags&flagRecurse != 0 }
 
 func newWatches() *watches {
 	return &watches{
@@ -87,20 +90,20 @@ func (w *watches) removePath(path string) ([]uint32, error) {
 	}
 
 	watch := w.wd[wd]
-	if recurse && !watch.recurse {
+	if recurse && !watch.recurse() {
 		return nil, fmt.Errorf("can't use /... with non-recursive watch %q", path)
 	}
 
 	delete(w.path, path)
 	delete(w.wd, wd)
-	if !watch.recurse {
+	if !watch.recurse() {
 		return []uint32{wd}, nil
 	}
 
 	wds := make([]uint32, 0, 8)
 	wds = append(wds, wd)
 	for p, rwd := range w.path {
-		if strings.HasPrefix(p, path) {
+		if hasPathPrefix(p, path) {
 			delete(w.path, p)
 			delete(w.wd, rwd)
 			wds = append(wds, rwd)
@@ -139,7 +142,7 @@ func newBackend(ev chan Event, errs chan error) (backend, error) {
 	// I/O operations won't terminate on close.
 	fd, errno := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
 	if fd == -1 {
-		return nil, errno
+		return nil, fmt.Errorf("fsnotify: initializing inotify: %w", errno)
 	}
 
 	w := &inotify{
@@ -167,6 +170,11 @@ func (w *inotify) Close() error {
 	if err != nil {
 		return err
 	}
+	w.mu.Lock()
+	for name := range w.watches.path {
+		w.remove(name)
+	}
+	w.mu.Unlock()
 
 	<-w.doneResp // Wait for readEvents() to finish.
 	return nil
@@ -188,11 +196,8 @@ func (w *inotify) AddWith(path string, opts ...addOpt) error {
 		return fmt.Errorf("%w: %s", xErrUnsupported, with.op)
 	}
 
-	add := func(path string, with withOpts, recurse bool) error {
+	add := func(path string, with withOpts, wf watchFlag) error {
 		var flags uint32
-		if with.noFollow {
-			flags |= unix.IN_DONT_FOLLOW
-		}
 		if with.op.Has(Create) {
 			flags |= unix.IN_CREATE
 		}
@@ -220,7 +225,7 @@ func (w *inotify) AddWith(path string, opts ...addOpt) error {
 		if with.op.Has(xUnportableCloseRead) {
 			flags |= unix.IN_CLOSE_NOWRITE
 		}
-		return w.register(path, flags, recurse)
+		return w.register(path, flags, wf)
 	}
 
 	w.mu.Lock()
@@ -248,14 +253,18 @@ func (w *inotify) AddWith(path string, opts ...addOpt) error {
 				w.sendEvent(Event{Name: root, Op: Create})
 			}
 
-			return add(root, with, true)
+			wf := flagRecurse
+			if root == path {
+				wf |= flagByUser
+			}
+			return add(root, with, wf)
 		})
 	}
 
-	return add(path, with, false)
+	return add(path, with, 0)
 }
 
-func (w *inotify) register(path string, flags uint32, recurse bool) error {
+func (w *inotify) register(path string, flags uint32, wf watchFlag) error {
 	return w.watches.updatePath(path, func(existing *watch) (*watch, error) {
 		if existing != nil {
 			flags |= existing.flags | unix.IN_MASK_ADD
@@ -272,10 +281,10 @@ func (w *inotify) register(path string, flags uint32, recurse bool) error {
 
 		if existing == nil {
 			return &watch{
-				wd:      uint32(wd),
-				path:    path,
-				flags:   flags,
-				recurse: recurse,
+				wd:         uint32(wd),
+				path:       path,
+				flags:      flags,
+				watchFlags: wf,
 			}, nil
 		}
 
@@ -425,11 +434,7 @@ func (w *inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[65536]byte, offs
 		nameLen = uint32(inEvent.Len)
 	)
 	if nameLen > 0 {
-		/// Point "bytes" at the first byte of the filename
-		bb := *buf
-		bytes := (*[unix.PathMax]byte)(unsafe.Pointer(&bb[offset+unix.SizeofInotifyEvent]))[:nameLen:nameLen]
-		/// The filename is padded with NULL bytes. TrimRight() gets rid of those.
-		name += "/" + strings.TrimRight(string(bytes[0:nameLen]), "\x00")
+		name += "/" + inotifyEventName(buf, offset, nameLen)
 	}
 
 	if debug {
@@ -450,7 +455,9 @@ func (w *inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[65536]byte, offs
 	// We can't really update the state when a watched path is moved; only
 	// IN_MOVE_SELF is sent and not IN_MOVED_{FROM,TO}. So remove the watch.
 	if inEvent.Mask&unix.IN_MOVE_SELF == unix.IN_MOVE_SELF {
-		if watch.recurse { // Do nothing
+		// Watch is set up as part of recurse: do nothing as the move gets
+		// registered from the parent directory.
+		if watch.recurse() && !watch.byUser() {
 			return Event{}, true
 		}
 
@@ -459,6 +466,10 @@ func (w *inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[65536]byte, offs
 			if !w.sendError(err) {
 				return Event{}, false
 			}
+		}
+
+		if watch.recurse() {
+			return Event{Name: watch.path, Op: Rename}, true
 		}
 	}
 
@@ -473,17 +484,16 @@ func (w *inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[65536]byte, offs
 
 	ev := w.newEvent(name, inEvent.Mask, inEvent.Cookie)
 	// Need to update watch path for recurse.
-	if watch.recurse {
+	if watch.recurse() {
 		isDir := inEvent.Mask&unix.IN_ISDIR == unix.IN_ISDIR
 		/// New directory created: set up watch on it.
 		if isDir && ev.Has(Create) {
-			err := w.register(ev.Name, watch.flags, true)
+			err := w.register(ev.Name, watch.flags, flagRecurse)
 			if !w.sendError(err) {
 				return Event{}, false
 			}
 
-			// This was a directory rename, so we need to update all the
-			// children.
+			// Directory rename, so we need to update all the children.
 			//
 			// TODO: this is of course pretty slow; we should use a better data
 			// structure for storing all of this, e.g. store children in the
@@ -491,13 +501,19 @@ func (w *inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[65536]byte, offs
 			// in the future. For now I'm okay with this as it's not publicly
 			// available. Correctness first, performance second.
 			if ev.renamedFrom != "" {
-				for k, ww := range w.watches.wd {
-					if k == watch.wd || ww.path == ev.Name {
+				for path, wd := range w.watches.path {
+					if wd == watch.wd || path == ev.Name {
 						continue
 					}
-					if strings.HasPrefix(ww.path, ev.renamedFrom) {
-						ww.path = strings.Replace(ww.path, ev.renamedFrom, ev.Name, 1)
-						w.watches.wd[k] = ww
+
+					if hasPathPrefix(path, ev.renamedFrom) {
+						delete(w.watches.path, path)
+						path = strings.Replace(path, ev.renamedFrom, ev.Name, 1)
+						w.watches.path[path] = wd
+
+						ww := w.watches.wd[wd]
+						ww.path = path
+						w.watches.wd[wd] = ww
 					}
 				}
 			}
@@ -507,12 +523,13 @@ func (w *inotify) handleEvent(inEvent *unix.InotifyEvent, buf *[65536]byte, offs
 	return ev, true
 }
 
-func (w *inotify) isRecursive(path string) bool {
-	ww := w.watches.byPath(path)
-	if ww == nil { // path could be a file, so also check the Dir.
-		ww = w.watches.byPath(filepath.Dir(path))
+func inotifyEventName(buf *[65536]byte, offset, nameLen uint32) string {
+	start := int(offset + unix.SizeofInotifyEvent)
+	bytes := (*[unix.PathMax]byte)(unsafe.Pointer(&buf[start]))[:nameLen:nameLen]
+	for nameLen > 0 && bytes[nameLen-1] == 0 {
+		nameLen--
 	}
-	return ww != nil && ww.recurse
+	return string(bytes[:nameLen])
 }
 
 func (w *inotify) newEvent(name string, mask, cookie uint32) Event {
@@ -578,6 +595,6 @@ func (w *inotify) state() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for wd, ww := range w.watches.wd {
-		fmt.Fprintf(os.Stderr, "%4d: recurse=%t %q\n", wd, ww.recurse, ww.path)
+		fmt.Fprintf(os.Stderr, "%4d: %q  watchFlags=0x%x\n", wd, ww.path, ww.watchFlags)
 	}
 }
