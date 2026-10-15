@@ -1,3 +1,8 @@
+> **Fork notice:** this is a fork of [fsnotify/fsnotify](https://github.com/fsnotify/fsnotify),
+> maintained for [Bellui](https://bellui.com) under the module path
+> `github.com/belluikit/fsnotify`. Upstream copyright and the BSD-3-Clause license
+> are retained in full (see `LICENSE`); what changed and why is in [FORK.md](FORK.md).
+
 fsnotify is a Go library to provide cross-platform filesystem notifications on
 Windows, Linux, macOS, BSD, and illumos.
 
