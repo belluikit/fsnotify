@@ -1,5 +1,3 @@
-# 
-
 watch /
 
 mkdir /sub       # Create sub-directory
@@ -15,10 +13,6 @@ Output:
 	remove /sub
 	remove /file
 
-	dragonfly: # TODO: not sure why the REMOVE /sub is dropped.
-		create    /sub
-		create    /file
-		remove    /file
 	fen:
 		create /sub
 		create /file

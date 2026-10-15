@@ -163,14 +163,14 @@ func applyOpt(have, want string, opt ...DiffOpt) (string, string) {
 				want = "{}"
 			}
 
-			var h interface{}
+			var h any
 			haveJ, err := indentJSON([]byte(have), &h, "", "    ")
 			if err != nil {
 				have = fmt.Sprintf("ztest.Diff: ERROR formatting have: %s\ntext: %s", err, have)
 			} else {
 				have = string(haveJ)
 			}
-			var w interface{}
+			var w any
 			wantJ, err := indentJSON([]byte(want), &w, "", "    ")
 			if err != nil {
 				want = fmt.Sprintf("ztest.Diff: ERROR formatting want: %s\ntext: %s", err, want)
@@ -530,25 +530,13 @@ func makeUnifiedDiff(diff unifiedDiff) string {
 	return out.String()
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 func splitLines(s string) []string {
 	lines := strings.SplitAfter(s, "\n")
 	lines[len(lines)-1] += "\n"
 	return lines
 }
 
-func indentJSON(data []byte, v interface{}, prefix, indent string) ([]byte, error) {
+func indentJSON(data []byte, v any, prefix, indent string) ([]byte, error) {
 	err := json.Unmarshal(data, v)
 	if err != nil {
 		return nil, err

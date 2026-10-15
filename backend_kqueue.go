@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -245,9 +246,8 @@ func (w *kqueue) Close() error {
 		return nil
 	}
 
-	pathsToRemove := w.watches.listPaths(false)
-	for _, name := range pathsToRemove {
-		w.Remove(name)
+	for _, name := range w.watches.listPaths(false) {
+		w.remove2(name, true)
 	}
 
 	unix.Close(w.closepipe[1]) // Send "quit" message to readEvents
@@ -287,7 +287,11 @@ func (w *kqueue) remove(name string, unwatchFiles bool) error {
 	if w.isClosed() {
 		return nil
 	}
+	return w.remove2(name, unwatchFiles)
+}
 
+// remove() but without checking isClosed
+func (w *kqueue) remove2(name string, unwatchFiles bool) error {
 	name = filepath.Clean(name)
 	info, ok := w.watches.byPath(name)
 	if !ok {
@@ -305,12 +309,11 @@ func (w *kqueue) remove(name string, unwatchFiles bool) error {
 
 	// Find all watched paths that are in this directory that are not external.
 	if unwatchFiles && isDir {
-		pathsToRemove := w.watches.watchesInDir(name)
-		for _, name := range pathsToRemove {
+		for _, name := range w.watches.watchesInDir(name) {
 			// Since these are internal, not much sense in propagating error to
 			// the user, as that will just confuse them with an error about a
 			// path they did not explicitly watch themselves.
-			w.Remove(name)
+			w.remove2(name, false)
 		}
 	}
 	return nil
@@ -376,19 +379,12 @@ func (w *kqueue) addWatch(name string, flags uint32, listDir bool) (string, erro
 			}
 		}
 
-		// Retry on EINTR; open() can return EINTR in practice on macOS.
-		// See #354, and Go issues 11180 and 39237.
-		for {
-			info.wd, err = unix.Open(name, openMode, 0)
-			if err == nil {
-				break
-			}
-			if errors.Is(err, unix.EINTR) {
-				continue
-			}
+		info.wd, err = internal.IgnoringEINTR(func() (int, error) {
+			return unix.Open(name, openMode, 0)
+		})
+		if err != nil {
 			return "", err
 		}
-
 		info.isDir = fi.IsDir()
 	}
 
@@ -436,9 +432,10 @@ func (w *kqueue) readEvents() {
 
 	eventBuffer := make([]unix.Kevent_t, 10)
 	for {
-		kevents, err := w.read(eventBuffer)
-		// EINTR is okay, the syscall was interrupted before timeout expired.
-		if err != nil && err != unix.EINTR {
+		kevents, err := internal.IgnoringEINTR(func() ([]unix.Kevent_t, error) {
+			return w.read(eventBuffer)
+		})
+		if err != nil {
 			if !w.sendError(fmt.Errorf("fsnotify.readEvents: %w", err)) {
 				return
 			}
@@ -583,12 +580,12 @@ func (w *kqueue) watchDirectoryFiles(dirPath string) error {
 
 		cleanPath, err := w.internalWatch(path, fi)
 		if err != nil {
-			// No permission to read the file; that's not a problem: just skip.
-			// But do add it to w.fileExists to prevent it from being picked up
-			// as a "new" file later (it still shows up in the directory
-			// listing).
+			// No permission, entry resolved to a missing target (e.g. a
+			// dangling symlink), or doesn't exist: not a problem, just skip.
+			// But do mark it as seen to prevent it from being picked up as a
+			// "new" file later (it still shows up in the directory listing).
 			switch {
-			case errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM):
+			case errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) || errors.Is(err, os.ErrNotExist):
 				cleanPath = filepath.Clean(path)
 			default:
 				return fmt.Errorf("%q: %w", path, err)
@@ -702,4 +699,20 @@ func (w *kqueue) xSupports(op Op) bool {
 		return false
 	}
 	return true
+}
+
+func (w *kqueue) state() {
+	w.watches.mu.Lock()
+	defer w.watches.mu.Unlock()
+
+	all := make([]int, 0, len(w.watches.wd))
+	for wd := range w.watches.wd {
+		all = append(all, wd)
+	}
+	sort.Ints(all)
+
+	for _, wd := range all {
+		ww := w.watches.wd[wd]
+		fmt.Fprintf(os.Stderr, "%4d  %q  linkname=%q\n", wd, ww.name, ww.linkName)
+	}
 }
