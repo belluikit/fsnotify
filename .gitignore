@@ -8,3 +8,16 @@
 
 /test/kqueue
 /test/a.out
+
+# OS and editor files, Go test and profiling output
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+*.out
+*.prof
+coverage.out
+coverage.html
+coverage.txt
